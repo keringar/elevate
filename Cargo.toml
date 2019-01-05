@@ -6,8 +6,10 @@ edition = "2018"
 
 [dependencies]
 winit = "0.18.0"
-gfx-hal = "0.1.0"
 env_logger = "0.6.0"
 log = "0.4.6"
-glsl-to-spirv = "0.1.7"
+gfx-hal = "0.1.0"
 gfx-backend-vulkan = "0.1.0"
+
+[build-dependencies]
+shaderc = "0.3.12"
