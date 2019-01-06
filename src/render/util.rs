@@ -1,9 +1,31 @@
-use gfx_hal::Backend;
+use gfx_hal::queue::family::QueueFamily;
+use gfx_hal::{buffer, memory, Adapter, Backend, PhysicalDevice};
 
-pub fn print_adapter_info<B: Backend>(adapter: &gfx_hal::adapter::Adapter<B>) {
-    use gfx_hal::queue::family::QueueFamily;
-    use gfx_hal::PhysicalDevice;
+pub fn get_memory_heap<B: Backend>(
+    adapter: &gfx_hal::adapter::Adapter<B>,
+    requirements: gfx_hal::memory::Requirements,
+) -> gfx_hal::adapter::MemoryTypeId {
+    adapter
+        .physical_device
+        .memory_properties()
+        .memory_types
+        .into_iter()
+        .enumerate()
+        .position(|(id, mem_type)| {
+            // type_mask is a bit field where each bit represents a memory type. If the bit is set
+            // to 1 it means we can use that type for our buffer. So this code finds the first
+            // memory type that has a `1` (or, is allowed), and is visible to the CPU.
+            requirements.type_mask & (1 << id) != 0
+                && mem_type
+                    .properties
+                    .contains(memory::Properties::CPU_VISIBLE)
+                && mem_type.properties.contains(memory::Properties::COHERENT)
+        })
+        .unwrap()
+        .into()
+}
 
+pub fn print_adapter_info<B: Backend>(adapter: &Adapter<B>) {
     println!("{}\n{:?}", adapter.info.name, adapter.info.device_type);
 
     println!("\nPhysical Device Properties");

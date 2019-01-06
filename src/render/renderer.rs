@@ -1,11 +1,22 @@
 use back;
 use gfx_hal::{
-    command, format, image, pso, queue, window, Adapter, Backbuffer, Backend, Capability,
+    buffer, command, format, image, pso, queue, window, Adapter, Backbuffer, Backend, Capability,
     CommandQueue, Device, Graphics, Instance, PhysicalDevice, QueueFamily, Surface, Swapchain,
     SwapchainConfig,
 };
 
+use super::util::*;
+use super::vertex::Vertex;
+
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+lazy_static! {
+    static ref vertices: Vec<Vertex> = vec![
+        Vertex::new((0.0, -0.5), (1.0, 1.0, 1.0)),
+        Vertex::new((0.5, 0.5), (0.0, 1.0, 0.0)),
+        Vertex::new((-0.5, 0.5), (0.0, 0.0, 1.0)),
+    ];
+}
 
 pub struct Renderer {
     current_frame: usize,
@@ -14,6 +25,8 @@ pub struct Renderer {
     image_available_semaphores: Vec<<back::Backend as Backend>::Semaphore>,
     submission_command_buffers:
         Vec<command::CommandBuffer<back::Backend, Graphics, command::MultiShot, command::Primary>>,
+    vertex_buffer_memory: <back::Backend as Backend>::Memory,
+    vertex_buffer: <back::Backend as Backend>::Buffer,
     command_pool: gfx_hal::pool::CommandPool<back::Backend, Graphics>,
     swapchain_framebuffers: Vec<<back::Backend as Backend>::Framebuffer>,
     gfx_pipeline: <back::Backend as Backend>::GraphicsPipeline,
@@ -29,7 +42,6 @@ pub struct Renderer {
     device: <back::Backend as gfx_hal::Backend>::Device,
     surface: <back::Backend as gfx_hal::Backend>::Surface,
     adapter: gfx_hal::Adapter<back::Backend>,
-    instance: back::Instance,
 }
 
 impl Renderer {
@@ -38,7 +50,7 @@ impl Renderer {
         let mut adapter = instance.enumerate_adapters().into_iter().next().unwrap();
         let mut surface = instance.create_surface(window);
 
-        crate::util::print_adapter_info(&adapter);
+        print_adapter_info(&adapter);
 
         let (device, command_queues, queue_type, qf_id) =
             open_compatible_device(&mut adapter, &surface);
@@ -60,12 +72,33 @@ impl Renderer {
             create_sync_objects(&device);
 
         let mut command_pool = create_command_pool(&device, queue_type, qf_id);
+
+        let (mut vertex_buffer, requirements) = create_vertex_buffer(&device);
+
+        // copy vertices into vertex buffer
+        let vertex_buffer_memory = unsafe {
+            let memory = device
+                .allocate_memory(get_memory_heap(&adapter, requirements), requirements.size)
+                .unwrap();
+            device
+                .bind_buffer_memory(&memory, 0, &mut vertex_buffer)
+                .unwrap();
+            let vertex_buffer_ptr = device.map_memory(&memory, 0..requirements.size).unwrap();
+            let vertices_ptr = vertices.as_ptr() as *const u8;
+            let vertices_len = vertices.len() * std::mem::size_of::<Vertex>();
+            std::ptr::copy_nonoverlapping(vertices_ptr, vertex_buffer_ptr, vertices_len);
+            device.unmap_memory(&memory);
+
+            memory
+        };
+
         let submission_command_buffers = create_command_buffers(
             &mut command_pool,
             &render_pass,
             &swapchain_framebuffers,
             extent,
             &gfx_pipeline,
+            &vertex_buffer,
         );
 
         Renderer {
@@ -74,6 +107,8 @@ impl Renderer {
             render_finished_semaphores,
             image_available_semaphores,
             submission_command_buffers,
+            vertex_buffer_memory,
+            vertex_buffer,
             command_pool,
             swapchain_framebuffers,
             gfx_pipeline,
@@ -86,7 +121,6 @@ impl Renderer {
             device,
             surface,
             adapter,
-            instance,
         }
     }
 
@@ -99,15 +133,17 @@ impl Renderer {
             self.device
                 .wait_for_fence(in_flight_fence, std::u64::MAX)
                 .unwrap();
-            self.device.reset_fence(in_flight_fence).unwrap();
 
-            let image_index = self
-                .swapchain
-                .acquire_image(
-                    std::u64::MAX,
-                    window::FrameSync::Semaphore(image_available_semaphore),
-                )
-                .unwrap();
+            let image_index = match self.swapchain.acquire_image(
+                std::u64::MAX,
+                window::FrameSync::Semaphore(image_available_semaphore),
+            ) {
+                Ok(index) => index,
+                Err(_) => {
+                    self.recreate_swapchain();
+                    return;
+                }
+            };
 
             let i = image_index as usize;
             let submission = queue::Submission {
@@ -119,6 +155,8 @@ impl Renderer {
                 signal_semaphores: vec![render_finished_semaphore],
             };
 
+            self.device.reset_fence(in_flight_fence).unwrap();
+
             self.command_queues[0].submit(submission, Some(in_flight_fence));
 
             self.swapchain
@@ -127,54 +165,120 @@ impl Renderer {
                     image_index,
                     vec![render_finished_semaphore],
                 )
-                .unwrap();
+                .expect("Unable to present image to swapchain");
 
             self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
     }
 
-    pub fn wait_until_idle(&self) {
+    pub unsafe fn recreate_swapchain(&mut self) {
+        // Wait for resources to be idle
         self.device.wait_idle().unwrap();
-    }
 
-    pub unsafe fn cleanup(self) {
-        for fence in self.in_flight_fences {
-            self.device.destroy_fence(fence);
-        }
+        // Take out old resources
+        let old_swapchain = std::mem::replace(&mut self.swapchain, std::mem::uninitialized());
+        let old_swapchain_images = std::mem::replace(&mut self.swapchain_images, Vec::new());
+        let old_render_pass = std::mem::replace(&mut self.render_pass, std::mem::uninitialized());
+        let old_pipeline_layout =
+            std::mem::replace(&mut self.pipeline_layout, std::mem::uninitialized());
+        let old_descriptor_set_layouts =
+            std::mem::replace(&mut self.descriptor_set_layouts, Vec::new());
+        let old_gfx_pipeline = std::mem::replace(&mut self.gfx_pipeline, std::mem::uninitialized());
+        let old_swapchain_framebuffers =
+            std::mem::replace(&mut self.swapchain_framebuffers, Vec::new());
+        let _old_submission_command_buffers =
+            std::mem::replace(&mut self.submission_command_buffers, Vec::new());
 
-        for semaphore in self.render_finished_semaphores {
-            self.device.destroy_semaphore(semaphore);
-        }
-
-        for semaphore in self.image_available_semaphores {
-            self.device.destroy_semaphore(semaphore);
-        }
-
-        self.device
-            .destroy_command_pool(self.command_pool.into_raw());
-
-        for framebuffer in self.swapchain_framebuffers {
+        // Begin destroying them all
+        self.command_pool.reset();
+        for framebuffer in old_swapchain_framebuffers {
             self.device.destroy_framebuffer(framebuffer);
         }
-
-        self.device.destroy_graphics_pipeline(self.gfx_pipeline);
-
-        for dsl in self.descriptor_set_layouts {
+        self.device.destroy_graphics_pipeline(old_gfx_pipeline);
+        for dsl in old_descriptor_set_layouts {
             self.device.destroy_descriptor_set_layout(dsl);
         }
-
-        self.device.destroy_pipeline_layout(self.pipeline_layout);
-
-        self.device.destroy_render_pass(self.render_pass);
-
-        for (_, image_view) in self.swapchain_images.into_iter() {
+        self.device.destroy_pipeline_layout(old_pipeline_layout);
+        self.device.destroy_render_pass(old_render_pass);
+        for (_, image_view) in old_swapchain_images.into_iter() {
             self.device.destroy_image_view(image_view);
         }
+        self.device.destroy_swapchain(old_swapchain);
 
-        self.device.destroy_swapchain(self.swapchain);
+        // Create replacement resources
+        let (swapchain, extent, backbuffer, format) =
+            create_swapchain(&self.adapter, &self.device, &mut self.surface, None);
+        let swapchain_images = create_image_views(backbuffer, format, &self.device);
+        let render_pass = create_render_pass(&self.device, Some(format));
+        let (descriptor_set_layouts, pipeline_layout, gfx_pipeline) =
+            create_graphics_pipeline(&self.device, extent, &render_pass);
+        let swapchain_framebuffers =
+            create_framebuffers(&self.device, &render_pass, &swapchain_images, extent);
+        let submission_command_buffers = create_command_buffers(
+            &mut self.command_pool,
+            &render_pass,
+            &swapchain_framebuffers,
+            extent,
+            &gfx_pipeline,
+            &self.vertex_buffer,
+        );
+
+        // Replace uninitialized values
+        self.swapchain = swapchain;
+        self.swapchain_images = swapchain_images;
+        self.render_pass = render_pass;
+        self.pipeline_layout = pipeline_layout;
+        self.descriptor_set_layouts = descriptor_set_layouts;
+        self.gfx_pipeline = gfx_pipeline;
+        self.swapchain_framebuffers = swapchain_framebuffers;
+        self.submission_command_buffers = submission_command_buffers;
+    }
+
+    pub fn cleanup(self) {
+        unsafe {
+            self.device.wait_idle().unwrap();
+
+            self.device.destroy_buffer(self.vertex_buffer);
+
+            self.device.free_memory(self.vertex_buffer_memory);
+
+            for fence in self.in_flight_fences {
+                self.device.destroy_fence(fence);
+            }
+
+            for semaphore in self.render_finished_semaphores {
+                self.device.destroy_semaphore(semaphore);
+            }
+
+            for semaphore in self.image_available_semaphores {
+                self.device.destroy_semaphore(semaphore);
+            }
+
+            self.device
+                .destroy_command_pool(self.command_pool.into_raw());
+
+            for framebuffer in self.swapchain_framebuffers {
+                self.device.destroy_framebuffer(framebuffer);
+            }
+
+            self.device.destroy_graphics_pipeline(self.gfx_pipeline);
+
+            for dsl in self.descriptor_set_layouts {
+                self.device.destroy_descriptor_set_layout(dsl);
+            }
+
+            self.device.destroy_pipeline_layout(self.pipeline_layout);
+
+            self.device.destroy_render_pass(self.render_pass);
+
+            for (_, image_view) in self.swapchain_images.into_iter() {
+                self.device.destroy_image_view(image_view);
+            }
+
+            self.device.destroy_swapchain(self.swapchain);
+        }
     }
 }
-
 fn open_compatible_device(
     adapter: &mut Adapter<back::Backend>,
     surface: &<back::Backend as Backend>::Surface,
@@ -377,9 +481,8 @@ fn create_graphics_pipeline(
             conservative: false,
         };
 
-        // Nothing for now since our vertex shader generates its own vertices
-        let vertex_buffers: Vec<gfx_hal::pso::VertexBufferDesc> = Vec::new();
-        let attributes: Vec<gfx_hal::pso::AttributeDesc> = Vec::new();
+        let vertex_buffers = Vertex::get_buffer_desc();
+        let attributes = Vertex::get_attribute_desc();
 
         let input_assembler = gfx_hal::pso::InputAssemblerDesc {
             primitive: gfx_hal::Primitive::TriangleList,
@@ -530,12 +633,31 @@ fn create_command_pool(
     }
 }
 
+fn create_vertex_buffer(
+    device: &<back::Backend as Backend>::Device,
+) -> (
+    <back::Backend as Backend>::Buffer,
+    gfx_hal::memory::Requirements,
+) {
+    unsafe {
+        let size = std::mem::size_of::<Vertex>() * vertices.len();
+        let buffer = device
+            .create_buffer(size as u64, buffer::Usage::VERTEX)
+            .unwrap();
+
+        let requirements = device.get_buffer_requirements(&buffer);
+
+        (buffer, requirements)
+    }
+}
+
 fn create_command_buffers<'a>(
     command_pool: &'a mut gfx_hal::pool::CommandPool<back::Backend, Graphics>,
     render_pass: &<back::Backend as Backend>::RenderPass,
     framebuffers: &[<back::Backend as Backend>::Framebuffer],
     extent: gfx_hal::window::Extent2D,
     pipeline: &<back::Backend as Backend>::GraphicsPipeline,
+    vertex_buffer: &<back::Backend as Backend>::Buffer,
 ) -> Vec<command::CommandBuffer<back::Backend, Graphics, command::MultiShot, command::Primary>> {
     let mut submission_command_buffers = Vec::new();
 
@@ -553,6 +675,9 @@ fn create_command_buffers<'a>(
 
             // begin render pass
             {
+                let vertex_buffers = vec![(vertex_buffer, 0)];
+                command_buffer.bind_vertex_buffers(0, vertex_buffers);
+
                 let render_area = pso::Rect {
                     x: 0,
                     y: 0,
@@ -560,6 +685,7 @@ fn create_command_buffers<'a>(
                     h: extent.height as _,
                 };
 
+                // we only have one attachment so we only need one clear value
                 let clear_values = vec![command::ClearValue::Color(command::ClearColor::Float([
                     0.0, 0.0, 0.0, 1.0,
                 ]))];
@@ -571,7 +697,7 @@ fn create_command_buffers<'a>(
                     clear_values.iter(),
                 );
 
-                render_pass_inline_encoder.draw(0..3, 0..1);
+                render_pass_inline_encoder.draw(0..vertices.len() as u32, 0..1);
             }
 
             command_buffer.finish();
